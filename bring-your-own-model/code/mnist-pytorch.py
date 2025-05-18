@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import sys
+from datetime import datetime
 
 #import sagemaker_containers
 import torch
@@ -13,6 +14,7 @@ import torch.optim as optim
 import torch.utils.data
 import torch.utils.data.distributed
 from torchvision import datasets, transforms
+import mlflow
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -140,33 +142,44 @@ def train(args):
 
     optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum)
 
-    for epoch in range(1, args.epochs + 1):
-        model.train()
-        for batch_idx, (data, target) in enumerate(train_loader, 1):
-            data, target = data.to(device), target.to(device)
-            optimizer.zero_grad()
-            output = model(data)
-            loss = F.nll_loss(output, target)
-            loss.backward()
-            if is_distributed and not use_cuda:
-                # average gradients manually for multi-machine cpu case only
-                _average_gradients(model)
-            optimizer.step()
-            if batch_idx % args.log_interval == 0:
-                logger.info(
-                    "Train Epoch: {} [{}/{} ({:.0f}%)] Loss: {:.6f}".format(
-                        epoch,
-                        batch_idx * len(data),
-                        len(train_loader.sampler),
-                        100.0 * batch_idx / len(train_loader),
-                        loss.item(),
+    # mlflow connection and experiment setup
+    mlflow.set_tracking_uri(args.mlflow_arn)
+    mlflow.set_experiment(args.mlflow_name)
+
+    # mlflow start logging a run
+    with mlflow.start_run(run_name=datetime.now().strftime("%Y%m%d_%H%M%S")):
+        # log hyperparameter passed
+        mlflow.log_params(vars(args))
+        
+        for epoch in range(1, args.epochs + 1):
+            model.train()
+            for batch_idx, (data, target) in enumerate(train_loader, 1):
+                data, target = data.to(device), target.to(device)
+                optimizer.zero_grad()
+                output = model(data)
+                loss = F.nll_loss(output, target)
+                loss.backward()
+                if is_distributed and not use_cuda:
+                    # average gradients manually for multi-machine cpu case only
+                    _average_gradients(model)
+                optimizer.step()
+                if batch_idx % args.log_interval == 0:
+                    logger.info(
+                        "Train Epoch: {} [{}/{} ({:.0f}%)] Loss: {:.6f}".format(
+                            epoch,
+                            batch_idx * len(data),
+                            len(train_loader.sampler),
+                            100.0 * batch_idx / len(train_loader),
+                            loss.item(),
+                        )
                     )
-                )
-        test(model, test_loader, device)
-    save_model(model, args.model_dir)
+                # log each epochs training loss
+                mlflow.log_metric("training_loss", loss.item(), step=epoch)
+            test(model, test_loader, device, epoch)
+        save_model(model, args.model_dir)
 
 
-def test(model, test_loader, device):
+def test(model, test_loader, device, epoch):
     model.eval()
     test_loss = 0
     correct = 0
@@ -183,6 +196,9 @@ def test(model, test_loader, device):
         "Test set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n".format(
             test_loss, correct, len(test_loader.dataset), 100.0 * correct / len(test_loader.dataset)
         )
+    )
+    mlflow.log_metric(
+        "test_accuracy", 100.0 * correct / len(test_loader.dataset), step=epoch
     )
 
 
@@ -204,6 +220,28 @@ def save_model(model, model_dir):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
+    parser.add_argument(
+        "--mlflow-arn",
+        type=str,
+        metavar="N",
+        help="mlflow arn created in sagemaker ai studio",
+    )
+
+    parser.add_argument(
+        "--mlflow-name",
+        type=str,
+        metavar="N",
+        help="experiment name in mlflow",
+    )
+
+    parser.add_argument(
+        "--experiment-size",
+        type=int,
+        default=64,
+        metavar="N",
+        help="input batch size for training (default: 64)",
+    )
+    
     # Data and model checkpoints directories
     parser.add_argument(
         "--batch-size",
